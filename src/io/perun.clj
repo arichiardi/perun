@@ -7,7 +7,6 @@
             [clojure.java.io :as io]
             [clojure.set :as set]
             [clojure.string :as string]
-            [clojure.edn :as edn]
             [io.perun.core :as perun]
             [io.perun.meta :as pm]))
 
@@ -122,6 +121,8 @@
    - width
    - height"
   []
+  ;; This prevents a Java icon appearing in the dock on a Mac, and stealing program focus
+  (System/setProperty "java.awt.headless" "true")
   (boot/with-pre-wrap fileset
     (let [pod (create-pod images-dimensions-deps)
           metas (trace :io.perun/images-dimensions
@@ -130,31 +131,12 @@
                          (io.perun.contrib.images-dimensions/images-dimensions ~metas {}))]
       (pm/set-meta fileset updated-metas))))
 
-(def ^:private ^:deps images-resize-deps
-  '[[image-resizer "0.1.8"]])
-
-(def ^:private +images-resize-defaults+
-  {:out-dir "public"
-   :resolutions #{3840 2560 1920 1280 1024 640}})
-
-(deftask images-resize
-  "Resize images to the provided resolutions.
-   Each image file would have resolution appended to it's name:
-   e.x. san-francisco.jpg would become san-francisco_3840.jpg"
-  [o out-dir     OUTDIR       str    "the output directory"
-   r resolutions RESOLUTIONS  #{int} "resoulitions to which images should be resized"]
-  (boot/with-pre-wrap fileset
-    (let [options (merge +images-resize-defaults+ *opts*)
-          tmp (boot/tmp-dir!)
-          pod (create-pod images-resize-deps)
-          metas (trace :io.perun/images-resize
-                       (meta-by-ext fileset [".png" ".jpeg" ".jpg"]))
-          updated-metas (pod/with-call-in @pod
-                         (io.perun.contrib.images-resize/images-resize ~(.getPath tmp) ~metas ~options))]
-      (perun/report-debug "images-resize" "new resized images" updated-metas)
-      (-> fileset
-          (commit tmp)
-          (pm/set-meta updated-metas)))))
+(defn apply-out-dir
+  [path old-out-dir new-out-dir]
+  (let [path-args (if (= old-out-dir new-out-dir)
+                    [path]
+                    [new-out-dir path])]
+    (apply perun/create-filepath path-args)))
 
 (defn render-in-pod
   "Renders paths in `inputs`, using `render-form-fn` in `pod`
@@ -231,9 +213,9 @@
   `passthru-fn` to handle setting changed metadata on files copied from the
   previous fileset. If input files should be removed from the fileset, set
   `rm-originals` to `true`."
-  [{:keys [task-name render-form-fn paths-fn passthru-fn tracer pod rm-originals]}]
-  (let [tmp  (boot/tmp-dir!)
-        prev (atom {})
+  [{:keys [task-name render-form-fn paths-fn passthru-fn tracer pod tmp rm-originals]}]
+  (let [prev (atom {})
+        tmp (or tmp (boot/tmp-dir!))
         pod (or pod (create-pod content-deps))]
     (fn [next-task]
       (fn [fileset]
@@ -299,11 +281,10 @@
   (let [global-meta (pm/get-global-meta fileset)]
     (reduce (fn [result {:keys [path] :as entry}]
               (let [ext-pattern (re-pattern (str "(" (string/join "|" extensions) ")$"))
-                    new-path (if out-ext
-                               (->> out-ext
-                                    (string/replace path ext-pattern)
-                                    (perun/create-filepath out-dir))
-                               (perun/create-filepath out-dir path))
+                    ext-path (if out-ext
+                               (string/replace path ext-pattern out-ext)
+                               path)
+                    new-path (apply-out-dir ext-path (:out-dir entry) out-dir)
                     path-meta (pm/path-meta path
                                             global-meta
                                             (boot/tmp-file (boot/tmp-get fileset path)))]
@@ -333,6 +314,69 @@
 (def ^:private +yaml-metadata-defaults+
   {:filterer identity
    :extensions []})
+
+(defn resize-paths
+  "Returns a map of path -> input for images-resize"
+  [fileset {:keys [out-dir parent-path meta resolutions] :as options} tmp-dir]
+  (let [global-meta (pm/get-global-meta fileset)
+        files (boot/ls fileset)]
+    (reduce
+     (fn [result {:keys [slug path extension] :as entry}]
+       (reduce
+        (fn [result* resolution]
+          (let [new-filename (str slug "_" resolution "." extension)
+                new-path (-> (perun/create-filepath parent-path new-filename)
+                             (apply-out-dir (:out-dir entry) out-dir))
+                input-file (first (boot/by-path [path] files))
+                img-meta (assoc (pm/path-meta new-path global-meta)
+                                :resolution resolution
+                                :input-paths #{path}
+                                :input-meta (merge (pm/meta-from-file fileset input-file)
+                                                   (select-keys input-file [:hash]))
+                                :tmp-dir tmp-dir)]
+            (assoc result*
+                   new-path (merge entry
+                                   meta
+                                   (when out-dir
+                                     {:out-dir out-dir})
+                                   img-meta))))
+        result
+        resolutions))
+     {}
+     (filter-meta-by-ext fileset options))))
+
+(def ^:private ^:deps images-resize-deps
+  '[[org.clojure/tools.namespace "0.3.0-alpha3"]
+    [image-resizer "0.1.8"]])
+
+(def ^:private +images-resize-defaults+
+  {:out-dir "public"
+   :resolutions #{3840 2560 1920 1280 1024 640}
+   :filterer identity
+   :extensions [".png" ".jpeg" ".jpg"]})
+
+(deftask images-resize
+  "Resize images to the provided resolutions.
+   Each image file would have resolution appended to it's name:
+   e.x. san-francisco.jpg would become san-francisco_3840.jpg"
+  [o out-dir     OUTDIR      str    "the output directory"
+   r resolutions RESOLUTIONS #{int} "resolutions to which images should be resized"
+   _ filterer    FILTER      code   "predicate to use for selecting entries (default: `identity`)"
+   e extensions  EXTENSIONS  [str]  "extensions of files to include (default: `[]`, aka, all extensions)"
+   m meta        META        edn    "metadata to set on each entry"]
+  ;; This prevents a Java icon appearing in the dock on a Mac, and stealing program focus
+  (System/setProperty "java.awt.headless" "true")
+  (let [pod (create-pod images-resize-deps)
+        tmp (boot/tmp-dir!)
+        options (merge +images-resize-defaults+ *opts*)]
+    (content-task
+     {:render-form-fn (fn [data] `(io.perun.contrib.images-resize/image-resize ~data))
+      :paths-fn #(resize-paths % options (.getPath tmp))
+      :passthru-fn content-passthru
+      :task-name "images-resize"
+      :tracer :io.perun/images-resize
+      :pod pod
+      :tmp tmp})))
 
 (deftask yaml-metadata
   "Parse YAML metadata at the beginning of files
@@ -724,20 +768,17 @@
    e extensions EXTENSIONS [str] "extensions of files to include"
    r renderer   RENDERER   sym   "page renderer (fully qualified symbol which resolves to a function)"
    m meta       META       edn   "metadata to set on each entry"]
-  (let [{:keys [renderer] :as options} (merge +render-defaults+ *opts*)]
+  (let [{:keys [renderer out-dir] :as options} (merge +render-defaults+ *opts*)]
     (letfn [(render-paths [fileset]
               (let [entries (filter-meta-by-ext fileset options)]
                 (reduce
-                 (fn [result {:keys [path out-dir] :as entry}]
+                 (fn [result {:keys [path] :as entry}]
                    (let [content (slurp (boot/tmp-file (boot/tmp-get fileset path)))
-                         path-args (if (= out-dir (:out-dir options))
-                                     [path]
-                                     [(:out-dir options) path])
-                         new-path (apply perun/create-filepath path-args)
+                         new-path (apply-out-dir path (:out-dir entry) out-dir)
                          new-entry (merge entry
                                           meta
                                           {:content content
-                                           :out-dir (:out-dir options)})]
+                                           :out-dir out-dir})]
                      (assoc result new-path {:meta    (pm/get-global-meta fileset)
                                              :entries entries
                                              :entry   new-entry
@@ -770,7 +811,9 @@
         path (perun/create-filepath out-dir page)
         static-path (fn [fileset]
                       {path {:meta (pm/get-global-meta fileset)
-                             :entry (assoc meta :path path)}})]
+                             :entry (assoc meta
+                                           :path path
+                                           :out-dir out-dir)}})]
     (render-task {:task-name "static"
                   :paths-fn static-path
                   :renderer renderer
@@ -791,7 +834,7 @@
                                                            (boot/tmp-get fileset)
                                                            boot/tmp-file
                                                            slurp))))
-               new-path  (perun/create-filepath out-dir path)
+               new-path  (apply-out-dir path (:out-dir entry) out-dir)
                new-entry (merge entry
                                 {:out-dir out-dir}
                                 (pm/path-meta path global-meta))]
@@ -1167,3 +1210,61 @@
         :passthru-fn content-passthru
         :task-name "inject-scripts"
         :tracer :io.perun/inject-scripts}))))
+
+(def ^:private ^:deps manifest-deps
+  '[[org.clojure/tools.namespace "0.3.0-alpha3"]
+    [cheshire "5.7.0"]])
+
+(def +manifest-defaults+
+  {:out-dir "public"
+   :icon-path "icon.png"
+   :resolutions #{192 512}
+   :theme-color "#ffffff"
+   :display "standalone"
+   :scope "/"})
+
+(deftask manifest*
+  [o out-dir     OUTDIR  str "the output directory"
+   t site-title  TITLE   str "name for the installable web application"
+   c theme-color COLOR   str "background color theme for icon (default \"#ffffff\")"
+   d display     DISPLAY str "display mode for browser (default \"standalone\")"
+   s scope       SCOPE   str "the scope to which the manifest applies (default \"/\")"]
+  (let [{:keys [site-title] :as opts} (merge +manifest-defaults+ *opts*)
+        pod (create-pod manifest-deps)]
+    (letfn [(manifest-path [fileset]
+              (let [icon-metas (filter-meta-by-ext fileset {:filterer :manifest-icon})
+                    path (perun/create-filepath out-dir "manifest.json")
+                    global-meta (pm/get-global-meta fileset)
+                    args (merge opts
+                                {:icons icon-metas
+                                 :input-paths (into #{} (map :path icon-metas))
+                                 :site-title (or site-title (:site-title global-meta))})]
+                {path args}))]
+      (content-task
+       {:render-form-fn (fn [data] `(io.perun.manifest/manifest ~data))
+        :paths-fn manifest-path
+        :task-name "manifest"
+        :tracer :io.perun/manifest
+        :pod pod}))))
+
+(deftask manifest
+  "Creates a manifest.json for Android (currently)"
+  [o out-dir     OUTDIR      str    "the output directory"
+   i icon-path   PATH        str    "The input icon to be resized (default \"icon.png\""
+   r resolutions RESOLUTIONS #{int} "resolutions to which images should be resized (default #{192 512})"
+   t site-title  TITLE       str    "name for the installable web application"
+   c theme-color COLOR       str    "background color theme for icon (default \"#ffffff\")"
+   d display     DISPLAY     str    "display mode for browser (default \"standalone\")"
+   s scope       SCOPE       str    "the scope to which the manifest applies (default \"/\")"]
+  (let [{:keys [out-dir icon-path resolutions site-title theme-color display scope]}
+        (merge +manifest-defaults+ *opts*)]
+    (comp (images-resize :out-dir out-dir
+                         :resolutions resolutions
+                         :filterer #(= (:path %) icon-path)
+                         :meta {:manifest-icon true})
+          (mime-type :filterer :manifest-icon)
+          (manifest* :out-dir out-dir
+                     :site-title site-title
+                     :theme-color theme-color
+                     :display display
+                     :scope scope))))
