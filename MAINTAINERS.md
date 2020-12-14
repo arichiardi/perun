@@ -62,7 +62,7 @@ only allowed) , we need to accomplish two things:
     * tag a commit (preferably both tag and commit should be signed):
       ```shell
       perun_version=$(grep "VERSION" version.properties | cut -d'=' -f2)
-      git commit --message "Release $perun_version"
+      git commit --all --message "Release $perun_version"
       git tag --sign "$perun_version" --message "Release $perun_version"
       ```
 
