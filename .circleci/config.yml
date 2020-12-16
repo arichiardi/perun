@@ -78,7 +78,7 @@ jobs:
           command: |
             jar_file=$(find target -name 'perun*.jar')
             boot --no-boot-script --exclude-clojure \
-                 --dependencies 'degree9/boot-semver:1.10.0' \
+                 --dependencies 'degree9/boot-semver:1.11.0' \
                  --init '(require (quote [degree9.boot-semver :refer :all]))' \
                  version push-snapshot --file "$jar_file"
 
@@ -97,7 +97,7 @@ jobs:
           command: |
             jar_file=$(find target -name 'perun*.jar')
             boot --no-boot-script --exclude-clojure \
-                 --dependencies 'degree9/boot-semver:1.10.0' \
+                 --dependencies 'degree9/boot-semver:1.11.0' \
                  --init '(require (quote [degree9.boot-semver :refer :all]))' \
                  version push-release --file "$jar_file"
 
